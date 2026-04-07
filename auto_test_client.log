@@ -1,0 +1,19 @@
+[CLIENT] Requested file: big.txt
+[CLIENT] Received DATA seq=0, len=1024
+[CLIENT] Sent cumulative ACK=1
+[CLIENT] Received DATA seq=1, len=1024
+[CLIENT] Sent cumulative ACK=2
+[CLIENT] Received DATA seq=2, len=1024
+[CLIENT] Sent cumulative ACK=3
+[CLIENT] Received DATA seq=3, len=1024
+[CLIENT] Sent cumulative ACK=4
+[CLIENT] Received DATA seq=4, len=904
+[CLIENT] Sent cumulative ACK=5
+[CLIENT] Received END
+[CLIENT] File saved as: /app/downloaded_big.txt
+[CLIENT] Sender file name: big.txt
+[CLIENT] Sender size: 5000, local size: 5000
+[CLIENT] Sender MD5: 1811ed45a571e515ed0faefc29f27026
+[CLIENT] Local  MD5: 1811ed45a571e515ed0faefc29f27026
+[CLIENT] MD5 match: True
+[CLIENT] Sent cumulative ACK=5

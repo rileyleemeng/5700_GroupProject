@@ -1,0 +1,7 @@
+- Output file: downloaded_big.txt
+- Sender file name: big.txt
+- Sender size: 5000
+- Local size: 5000
+- Sender MD5: 1811ed45a571e515ed0faefc29f27026
+- Local MD5: 1811ed45a571e515ed0faefc29f27026
+- MD5 match: True

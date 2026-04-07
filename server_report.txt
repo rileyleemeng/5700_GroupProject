@@ -1,0 +1,9 @@
+- Name of the transferred file: big.txt
+- Size of the transferred file: 5000 bytes
+- The number of packets sent from the server: 6
+- The number of retransmitted packets from the server: 0
+- The number of packets received from the client: 7
+- The time duration of the file transfer: 00:00:00
+- Sender MD5: 1811ed45a571e515ed0faefc29f27026
+- Sliding window size: 8
+- ACK receiver thread enabled: Yes
