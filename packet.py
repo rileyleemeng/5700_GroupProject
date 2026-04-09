@@ -80,3 +80,11 @@ def decode(data: bytes):
     pkt = Packet(pkt_type, seq, ack, payload)
     pkt.checksum = checksum
     return pkt
+
+
+def build_aad(session_id: bytes, pkt_type: int, seq: int, ack: int) -> bytes:
+    """
+    Additional Authenticated Data for AES-GCM.
+    These fields are authenticated but not encrypted.
+    """
+    return struct.pack("!8sBII", session_id, pkt_type, seq, ack)
