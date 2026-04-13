@@ -1,91 +1,103 @@
 import argparse
-import hashlib
-import json
 import os
 import socket
-import threading
+import sys
 import time
-from typing import Dict, List, Optional, Tuple
+from typing import Optional, Tuple
 
 from constants import (
     ACK,
-    ACK_POLL_INTERVAL,
+    CLIENT_HELLO,
     DATA,
+    DEFAULT_CLIENT_PORT,
     DEFAULT_SERVER_PORT,
+    DIGEST,
     END,
-    END_RETRIES,
     ERROR,
+    MAX_IDLE_TIMEOUTS,
     MAX_PAYLOAD,
     MAX_RETRIES,
     RAW_RECV_BUFFER,
     REQUEST,
+    RESULT,
+    SERVER_HELLO,
     TIMEOUT,
-    WINDOW_SIZE,
+    CLIENT_NONCE_LEN,
+    SERVER_NONCE_LEN,
+    SESSION_ID_LEN,
+    PSK,
+    VERSION,
 )
-from packet import Packet, decode, encode
+from packet import Packet, decode, encode, build_aad
 from raw_utils import build_ipv4_udp_packet, parse_ipv4_udp_packet
+from security import (
+    decrypt_aead,
+    derive_session_keys,
+    encrypt_aead,
+    generate_nonce,
+    build_gcm_nonce,
+    make_hmac,
+    sha256_bytes,
+    verify_hmac,
+)
+
+DEFAULT_SERVER_IP = '127.0.0.1'
+DEFAULT_CLIENT_IP = '127.0.0.1'
 
 
-DEFAULT_SERVER_IP = '0.0.0.0'
-
-
-class SRFTServer:
+class SRFTUDPServer:
     def __init__(
         self,
         server_ip: str,
         server_port: int,
+        client_ip: str,
+        client_port: int,
         timeout: float = TIMEOUT,
-        window_size: int = WINDOW_SIZE,
-        max_retries: int = MAX_RETRIES,
-        simulate_drop_once: Optional[int] = None,
+        max_idle_timeouts: int = MAX_IDLE_TIMEOUTS,
     ):
         self.server_ip = server_ip
         self.server_port = server_port
+        self.client_ip = client_ip
+        self.client_port = client_port
         self.timeout = timeout
-        self.window_size = max(1, window_size)
-        self.max_retries = max(1, max_retries)
-        self.simulate_drop_once = simulate_drop_once
-        self.drop_done = False
+        self.max_idle_timeouts = max(1, max_idle_timeouts)
 
         self.send_sock = socket.socket(socket.AF_INET, socket.SOCK_RAW, socket.IPPROTO_RAW)
         self.send_sock.setsockopt(socket.IPPROTO_IP, socket.IP_HDRINCL, 1)
 
         self.recv_sock = socket.socket(socket.AF_INET, socket.SOCK_RAW, socket.IPPROTO_UDP)
-        self.recv_sock.settimeout(None)
+        self.recv_sock.settimeout(self.timeout)
 
+        # Phase 2 session state
+        self.client_nonce: Optional[bytes] = None
+        self.server_nonce: Optional[bytes] = None
+        self.session_id: Optional[bytes] = None
+        self.keys = None
+        self.handshake_success = False
+
+        # Stats
         self.packets_sent = 0
         self.packets_retransmitted = 0
         self.packets_received = 0
-        self.start_time = None
+        self.aead_failures = 0
+        self.replay_drops = 0
+        self.sha256_match = False
 
-        self._ack_lock = threading.Lock()
-        self._highest_ack = 0
-        self._ack_stop = threading.Event()
-        self._ack_thread: Optional[threading.Thread] = None
-        self._ack_last_seen = time.time()
+        self.last_ack_seen = -1
+        self.start_time: Optional[float] = None
 
-    def _send_srft_packet(self, packet: Packet, client_ip: str, client_port: int) -> None:
-        if (
-            self.simulate_drop_once is not None
-            and packet.pkt_type == DATA
-            and packet.seq == self.simulate_drop_once
-            and not self.drop_done
-        ):
-            print(f'[DEBUG] simulate FIRST drop seq={packet.seq}')
-            self.drop_done = True
-            return
-
+    def _send_srft_packet(self, packet: Packet) -> None:
         raw_packet = build_ipv4_udp_packet(
-            src_ip=self.server_ip if self.server_ip != '0.0.0.0' else client_ip,
-            dst_ip=client_ip,
+            src_ip=self.server_ip,
+            dst_ip=self.client_ip,
             src_port=self.server_port,
-            dst_port=client_port,
+            dst_port=self.client_port,
             payload=encode(packet),
         )
-        self.send_sock.sendto(raw_packet, (client_ip, 0))
+        self.send_sock.sendto(raw_packet, (self.client_ip, 0))
         self.packets_sent += 1
 
-    def _recv_srft_packet(self, expected_client: Optional[Tuple[str, int]] = None):
+    def _recv_srft_packet(self) -> Tuple[Optional[Packet], Optional[Tuple[str, int]]]:
         while True:
             raw_data, _ = self.recv_sock.recvfrom(RAW_RECV_BUFFER)
             parsed = parse_ipv4_udp_packet(raw_data)
@@ -93,230 +105,319 @@ class SRFTServer:
                 continue
 
             src_ip, dst_ip, src_port, dst_port, payload = parsed
-
-            if dst_port != self.server_port:
+            if src_ip != self.client_ip or dst_ip != self.server_ip:
                 continue
-            if self.server_ip != '0.0.0.0' and dst_ip != self.server_ip:
-                continue
-            if expected_client is not None and (src_ip, src_port) != expected_client:
+            if src_port != self.client_port or dst_port != self.server_port:
                 continue
 
             self.packets_received += 1
-            pkt = decode(payload)
-            return pkt, (src_ip, src_port), dst_ip
+            return decode(payload), (src_ip, src_port)
 
-    def wait_for_request(self):
-        print('[Server] Waiting for client request...')
-        while True:
-            pkt, client_addr, local_dst_ip = self._recv_srft_packet()
-            if pkt is None:
-                print('[Server] Corrupted packet ignored')
-                continue
+    # ----------------------------
+    # Handshake
+    # ----------------------------
+    def do_handshake(self) -> bool:
+        print('[SERVER] Waiting for CLIENT_HELLO...')
 
-            if pkt.pkt_type == REQUEST:
-                filename = pkt.payload.decode('utf-8', errors='replace')
-                if self.server_ip == '0.0.0.0':
-                    self.server_ip = local_dst_ip
-                print(f"[Server] Got REQUEST for '{filename}' from {client_addr}")
-                return filename, client_addr
+        idle_timeouts = 0
+        while idle_timeouts < self.max_idle_timeouts:
+            try:
+                pkt, _ = self._recv_srft_packet()
 
-            print(f'[Server] Expected REQUEST, got type={pkt.pkt_type}, ignoring')
+                if pkt is None:
+                    print('[SERVER] Corrupted CLIENT_HELLO ignored')
+                    continue
 
-    def read_file_chunks(self, filepath: str) -> List[Tuple[int, bytes]]:
+                if pkt.pkt_type != CLIENT_HELLO:
+                    continue
+
+                payload = pkt.payload
+                min_len = 1 + CLIENT_NONCE_LEN + 32
+                if len(payload) < min_len:
+                    print('[SERVER] Invalid CLIENT_HELLO length')
+                    return False
+
+                version = payload[0]
+                self.client_nonce = payload[1:1 + CLIENT_NONCE_LEN]
+                recv_mac = payload[1 + CLIENT_NONCE_LEN:]
+
+                signed_part = bytes([version]) + self.client_nonce
+
+                if not verify_hmac(PSK, signed_part, recv_mac):
+                    print('[SERVER] CLIENT_HELLO HMAC verification failed')
+                    return False
+
+                self.server_nonce = generate_nonce(SERVER_NONCE_LEN)
+                self.session_id = generate_nonce(SESSION_ID_LEN)
+
+                reply_body = bytes([VERSION]) + self.server_nonce + self.session_id
+                reply_mac = make_hmac(PSK, reply_body)
+
+                resp = Packet(SERVER_HELLO, seq=0, ack=0, payload=reply_body + reply_mac)
+                self._send_srft_packet(resp)
+
+                self.keys = derive_session_keys(PSK, self.client_nonce, self.server_nonce)
+                self.handshake_success = True
+                print('[SERVER] Handshake success')
+                return True
+
+            except socket.timeout:
+                idle_timeouts += 1
+                print(f'[SERVER] Handshake timeout ({idle_timeouts}/{self.max_idle_timeouts})')
+
+        print('[SERVER] Handshake failed: too many timeouts')
+        return False
+
+    # ----------------------------
+    # Secure helpers
+    # ----------------------------
+    def _send_secure_packet(self, pkt_type: int, seq: int, ack: int, plaintext: bytes) -> None:
+        if not self.handshake_success or self.session_id is None or self.keys is None:
+            raise RuntimeError('secure session is not established')
+
+        aad = build_aad(self.session_id, pkt_type, seq, ack)
+
+        # Scheme B: use packet seq directly as AES-GCM nonce counter
+        nonce = build_gcm_nonce(self.keys['s2c_nonce_prefix'], seq)
+
+        ciphertext = encrypt_aead(self.keys['s2c_key'], nonce, aad, plaintext)
+
+        pkt = Packet(pkt_type, seq=seq, ack=ack, payload=ciphertext)
+        self._send_srft_packet(pkt)
+
+    def _decrypt_client_packet(self, pkt: Packet) -> Optional[bytes]:
+        if not self.handshake_success or self.session_id is None or self.keys is None:
+            return None
+
+        aad = build_aad(self.session_id, pkt.pkt_type, pkt.seq, pkt.ack)
+
+        # client -> server also uses seq directly as AES-GCM nonce counter
+        nonce = build_gcm_nonce(self.keys['c2s_nonce_prefix'], pkt.seq)
+
+        try:
+            plaintext = decrypt_aead(
+                self.keys['c2s_key'],
+                nonce,
+                aad,
+                pkt.payload,
+            )
+            return plaintext
+        except Exception:
+            self.aead_failures += 1
+            return None
+
+    # ----------------------------
+    # Request / ACK / RESULT
+    # ----------------------------
+    def wait_for_request(self) -> Optional[str]:
+        print('[SERVER] Waiting for secure REQUEST...')
+
+        idle_timeouts = 0
+        while idle_timeouts < self.max_idle_timeouts:
+            try:
+                pkt, _ = self._recv_srft_packet()
+
+                if pkt is None:
+                    print('[SERVER] Corrupted REQUEST ignored')
+                    continue
+
+                if pkt.pkt_type != REQUEST:
+                    continue
+
+                plaintext = self._decrypt_client_packet(pkt)
+                if plaintext is None:
+                    print('[SERVER] REQUEST AEAD authentication failed')
+                    continue
+
+                filename = plaintext.decode('utf-8', errors='replace')
+                print(f'[SERVER] Received secure REQUEST for file: {filename}')
+                return filename
+
+            except socket.timeout:
+                idle_timeouts += 1
+                print(f'[SERVER] Waiting REQUEST timeout ({idle_timeouts}/{self.max_idle_timeouts})')
+
+        return None
+
+    def wait_for_ack(self, current_seq: int) -> bool:
+        idle_timeouts = 0
+
+        while idle_timeouts < self.max_idle_timeouts:
+            try:
+                pkt, _ = self._recv_srft_packet()
+
+                if pkt is None:
+                    print('[SERVER] Corrupted ACK ignored')
+                    continue
+
+                if pkt.pkt_type != ACK:
+                    # Ignore unrelated packets while waiting for ACK
+                    continue
+
+                plaintext = self._decrypt_client_packet(pkt)
+                if plaintext is None:
+                    print('[SERVER] ACK AEAD authentication failed')
+                    continue
+
+                if plaintext != b'ACK':
+                    print('[SERVER] Invalid ACK payload ignored')
+                    continue
+
+                # Replay / duplicate ACK protection
+                if pkt.ack <= self.last_ack_seen:
+                    self.replay_drops += 1
+                    print(f'[SERVER] Duplicate/old ACK={pkt.ack} dropped')
+                    continue
+
+                self.last_ack_seen = pkt.ack
+                print(f'[SERVER] Received secure ACK={pkt.ack}')
+
+                if pkt.ack >= current_seq + 1:
+                    return True
+
+            except socket.timeout:
+                idle_timeouts += 1
+                return False
+
+        return False
+
+    def wait_for_result(self) -> bool:
+        print('[SERVER] Waiting for secure RESULT...')
+
+        idle_timeouts = 0
+        while idle_timeouts < self.max_idle_timeouts:
+            try:
+                pkt, _ = self._recv_srft_packet()
+
+                if pkt is None:
+                    print('[SERVER] Corrupted RESULT ignored')
+                    continue
+
+                if pkt.pkt_type != RESULT:
+                    continue
+
+                plaintext = self._decrypt_client_packet(pkt)
+                if plaintext is None:
+                    print('[SERVER] RESULT AEAD authentication failed')
+                    continue
+
+                if plaintext == b'OK':
+                    self.sha256_match = True
+                    print('[SERVER] Client reported SHA-256 match')
+                    return True
+                else:
+                    self.sha256_match = False
+                    print('[SERVER] Client reported SHA-256 mismatch')
+                    return False
+
+            except socket.timeout:
+                idle_timeouts += 1
+                print(f'[SERVER] Waiting RESULT timeout ({idle_timeouts}/{self.max_idle_timeouts})')
+
+        self.sha256_match = False
+        return False
+
+    # ----------------------------
+    # File transfer
+    # ----------------------------
+    def read_file_chunks(self, filepath: str):
         chunks = []
         seq = 0
         with open(filepath, 'rb') as f:
             while True:
-                chunk = f.read(MAX_PAYLOAD)
-                if not chunk:
+                data = f.read(MAX_PAYLOAD)
+                if not data:
                     break
-                chunks.append((seq, chunk))
+                chunks.append((seq, data))
                 seq += 1
         return chunks
 
-    def _ack_receiver_loop(self, client_addr: Tuple[str, int]) -> None:
-        self.recv_sock.settimeout(0.2)
-        try:
-            while not self._ack_stop.is_set():
-                try:
-                    pkt, _, _ = self._recv_srft_packet(expected_client=client_addr)
-                except socket.timeout:
-                    continue
+    def send_error(self, message: str) -> None:
+        pkt = Packet(ERROR, seq=0, ack=0, payload=message.encode('utf-8'))
+        self._send_srft_packet(pkt)
 
-                if pkt is None:
-                    continue
-
-                if pkt.pkt_type == ACK:
-                    with self._ack_lock:
-                        if pkt.ack > self._highest_ack:
-                            self._highest_ack = pkt.ack
-                        self._ack_last_seen = time.time()
-                    print(f'[DEBUG] ACK received: cumulative ack={pkt.ack}')
-        finally:
-            self.recv_sock.settimeout(None)
-
-    def _start_ack_thread(self, client_addr: Tuple[str, int]) -> None:
-        self._highest_ack = 0
-        self._ack_last_seen = time.time()
-        self._ack_stop.clear()
-        self._ack_thread = threading.Thread(
-            target=self._ack_receiver_loop,
-            args=(client_addr,),
-            daemon=True,
-            name='ack-receiver',
-        )
-        self._ack_thread.start()
-
-    def _stop_ack_thread(self) -> None:
-        self._ack_stop.set()
-        if self._ack_thread is not None:
-            self._ack_thread.join(timeout=1.0)
-            self._ack_thread = None
-
-    def _send_error(self, client_addr: Tuple[str, int], message: str) -> None:
-        pkt = Packet(ERROR, seq=0, ack=0, payload=message.encode())
-        self._send_srft_packet(pkt, client_addr[0], client_addr[1])
-
-    def _send_end(self, client_addr: Tuple[str, int], total_chunks: int, filename: str, file_md5: str, filesize: int) -> None:
-        payload = json.dumps(
-            {
-                'name': os.path.basename(filename),
-                'size': filesize,
-                'md5': file_md5,
-                'chunks': total_chunks,
-            }
-        ).encode()
-        pkt = Packet(END, seq=total_chunks, ack=0, payload=payload)
-
-        retries = 0
-        while retries < END_RETRIES:
-            self._send_srft_packet(pkt, client_addr[0], client_addr[1])
-            if retries > 0:
-                self.packets_retransmitted += 1
-
-            deadline = time.time() + self.timeout
-            while time.time() < deadline:
-                with self._ack_lock:
-                    current_ack = self._highest_ack
-                if current_ack >= total_chunks:
-                    print('[Server] END acknowledged')
-                    return
-                time.sleep(ACK_POLL_INTERVAL)
-
-            retries += 1
-            print(f'[Server] END timeout, retry #{retries}')
-
-        print('[Server] Warning: END not acknowledged')
-
-    def send_file(self, filepath: str, client_addr: Tuple[str, int], file_md5: str, filesize: int) -> bool:
+    def send_file(self, filepath: str) -> bool:
         chunks = self.read_file_chunks(filepath)
-        total = len(chunks)
-        print(f'[Server] File split into {total} chunks')
+        total_chunks = len(chunks)
+        print(f'[SERVER] File split into {total_chunks} chunk(s)')
+
         self.start_time = time.time()
 
-        outstanding: Dict[int, float] = {}
-        base = 0
-        next_seq_to_send = 0
-        retries_by_seq: Dict[int, int] = {}
+        for seq, chunk_data in chunks:
+            acked = False
+            retries = 0
 
-        self._start_ack_thread(client_addr)
-        try:
-            while base < total:
-                # Fill the sending window.
-                while next_seq_to_send < total and next_seq_to_send < base + self.window_size:
-                    seq_num, chunk_data = chunks[next_seq_to_send]
-                    pkt = Packet(DATA, seq=seq_num, ack=0, payload=chunk_data)
-                    self._send_srft_packet(pkt, client_addr[0], client_addr[1])
-                    outstanding[seq_num] = time.time()
-                    retries_by_seq.setdefault(seq_num, 0)
-                    next_seq_to_send += 1
+            while not acked and retries < MAX_RETRIES:
+                self._send_secure_packet(
+                    pkt_type=DATA,
+                    seq=seq,
+                    ack=0,
+                    plaintext=chunk_data,
+                )
+                print(f'[SERVER] Sent secure DATA seq={seq}, len={len(chunk_data)}')
 
-                with self._ack_lock:
-                    highest_acked = self._highest_ack
-                if highest_acked > base:
-                    for seq in range(base, min(highest_acked, total)):
-                        outstanding.pop(seq, None)
-                    base = highest_acked
-                    if base > 0 and (base % 100 == 0 or base == total):
-                        print(f'[Server] Progress: {base}/{total}')
-                    continue
-
-                if not outstanding:
-                    time.sleep(ACK_POLL_INTERVAL)
-                    continue
-
-                oldest_outstanding_seq = min(outstanding)
-                sent_at = outstanding[oldest_outstanding_seq]
-                if time.time() - sent_at < self.timeout:
-                    time.sleep(ACK_POLL_INTERVAL)
-                    continue
-
-                # Timeout: retransmit all currently outstanding packets (Go-Back-N behavior).
-                for seq in sorted(outstanding):
-                    retries_by_seq[seq] += 1
-                    if retries_by_seq[seq] > self.max_retries:
-                        print(f'[Server] FAILED: max retries for seq={seq}')
-                        return False
-
-                    chunk_data = chunks[seq][1]
-                    pkt = Packet(DATA, seq=seq, ack=0, payload=chunk_data)
-                    self._send_srft_packet(pkt, client_addr[0], client_addr[1])
-                    outstanding[seq] = time.time()
+                if retries > 0:
                     self.packets_retransmitted += 1
-                    print(f'[Server] Timeout seq={seq}, retry #{retries_by_seq[seq]}')
 
-            self._send_end(client_addr, total, filepath, file_md5, filesize)
-            return True
-        finally:
-            self._stop_ack_thread()
+                acked = self.wait_for_ack(seq)
+                if not acked:
+                    retries += 1
+                    print(f'[SERVER] Timeout / no valid ACK for seq={seq}, retry #{retries}')
 
-    def generate_report(self, filename: str, filesize: int, file_md5: str) -> None:
-        elapsed = 0 if self.start_time is None else time.time() - self.start_time
+            if not acked:
+                print(f'[SERVER] Failed: max retries exceeded for seq={seq}')
+                return False
+
+        # Send final SHA-256 digest
+        full_data = open(filepath, 'rb').read()
+        digest = sha256_bytes(full_data)
+
+        self._send_secure_packet(
+            pkt_type=DIGEST,
+            seq=total_chunks,
+            ack=0,
+            plaintext=digest,
+        )
+        print('[SERVER] Sent secure DIGEST')
+
+        self._send_secure_packet(
+            pkt_type=END,
+            seq=total_chunks + 1,
+            ack=0,
+            plaintext=b'END',
+        )
+        print('[SERVER] Sent secure END')
+
+        return True
+
+    # ----------------------------
+    # Reporting
+    # ----------------------------
+    def generate_report(self, filename: str, filesize: int) -> None:
+        elapsed = 0.0 if self.start_time is None else (time.time() - self.start_time)
         h = int(elapsed // 3600)
         m = int((elapsed % 3600) // 60)
         s = int(elapsed % 60)
 
         report = (
-            f'- Name of the transferred file: {filename}\n'
-            f'- Size of the transferred file: {filesize} bytes\n'
-            f'- The number of packets sent from the server: {self.packets_sent}\n'
-            f'- The number of retransmitted packets from the server: {self.packets_retransmitted}\n'
-            f'- The number of packets received from the client: {self.packets_received}\n'
-            f'- The time duration of the file transfer: {h:02d}:{m:02d}:{s:02d}\n'
-            f'- Sender MD5: {file_md5}\n'
-            f'- Sliding window size: {self.window_size}\n'
-            f'- ACK receiver thread enabled: Yes\n'
+            f'Name of the transferred file: {filename}\n'
+            f'Size of the transferred file: {filesize}\n'
+            f'The number of packets sent from the server: {self.packets_sent}\n'
+            f'The number of retransmitted packets from the server: {self.packets_retransmitted}\n'
+            f'The number of packets received from the client: {self.packets_received}\n'
+            f'The time duration of the file transfer (hh:min:ss): {h:02d}:{m:02d}:{s:02d}\n'
+            f'Security enabled (PSK + AEAD): Yes\n'
+            f'Handshake status: {"Success" if self.handshake_success else "Fail"}\n'
+            f'AEAD authentication failures (invalid packets dropped): {self.aead_failures}\n'
+            f'Replay drops (duplicate/out-of-window packets): {self.replay_drops}\n'
+            f'SHA-256 match: {"Yes" if self.sha256_match else "No"}\n'
         )
 
         print('\n========== Transfer Report ==========')
         print(report)
+
         with open('server_report.txt', 'w') as f:
             f.write(report)
-        print('[Server] Report saved to server_report.txt')
-
-    def run(self) -> None:
-        print(f'[Server] Starting raw UDP server on {self.server_ip}:{self.server_port}')
-        print(f'[Server] Window size={self.window_size}, timeout={self.timeout}s')
-        filename, client_addr = self.wait_for_request()
-
-        if not os.path.exists(filename):
-            print(f"[Server] File '{filename}' not found")
-            self._send_error(client_addr, f"File '{filename}' not found")
-            return
-
-        with open(filename, 'rb') as f:
-            file_bytes = f.read()
-        filesize = len(file_bytes)
-        md5 = hashlib.md5(file_bytes).hexdigest()
-        print(f'[Server] File: {filename}, Size: {filesize}, MD5: {md5}')
-
-        success = self.send_file(filename, client_addr, md5, filesize)
-        self.generate_report(filename, filesize, md5)
-
-        if success:
-            print('[Server] Transfer complete!')
-        else:
-            print('[Server] Transfer failed.')
 
     def close(self) -> None:
         self.send_sock.close()
@@ -324,33 +425,57 @@ class SRFTServer:
 
 
 def build_arg_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description='SRFT raw-socket UDP server')
-    parser.add_argument('server_ip', nargs='?', default=DEFAULT_SERVER_IP)
-    parser.add_argument('--port', type=int, default=DEFAULT_SERVER_PORT)
+    parser = argparse.ArgumentParser(description='SRFT raw-socket UDP server (Phase 2 secure)')
+    parser.add_argument('--server-ip', default=DEFAULT_SERVER_IP)
+    parser.add_argument('--client-ip', default=DEFAULT_CLIENT_IP)
+    parser.add_argument('--server-port', type=int, default=DEFAULT_SERVER_PORT)
+    parser.add_argument('--client-port', type=int, default=DEFAULT_CLIENT_PORT)
     parser.add_argument('--timeout', type=float, default=TIMEOUT)
-    parser.add_argument('--window-size', type=int, default=WINDOW_SIZE)
-    parser.add_argument('--max-retries', type=int, default=MAX_RETRIES)
-    parser.add_argument(
-        '--simulate-drop-once',
-        type=int,
-        default=None,
-        help='drop one DATA packet with this seq number once; useful for local retransmission tests',
-    )
+    parser.add_argument('--max-idle-timeouts', type=int, default=MAX_IDLE_TIMEOUTS)
     return parser
 
 
 def main() -> None:
     args = build_arg_parser().parse_args()
-    server = SRFTServer(
+
+    server = SRFTUDPServer(
         server_ip=args.server_ip,
-        server_port=args.port,
+        server_port=args.server_port,
+        client_ip=args.client_ip,
+        client_port=args.client_port,
         timeout=args.timeout,
-        window_size=args.window_size,
-        max_retries=args.max_retries,
-        simulate_drop_once=args.simulate_drop_once,
+        max_idle_timeouts=args.max_idle_timeouts,
     )
+
     try:
-        server.run()
+        if not server.do_handshake():
+            print('[SERVER] Handshake failed')
+            server.generate_report(filename='N/A', filesize=0)
+            sys.exit(2)
+
+        filename = server.wait_for_request()
+        if not filename:
+            print('[SERVER] Failed to receive valid secure REQUEST')
+            server.generate_report(filename='N/A', filesize=0)
+            sys.exit(2)
+
+        if not os.path.exists(filename):
+            print(f"[SERVER] File not found: {filename}")
+            server.send_error(f'File not found: {filename}')
+            server.generate_report(filename=filename, filesize=0)
+            sys.exit(2)
+
+        filesize = os.path.getsize(filename)
+
+        ok = server.send_file(filename)
+        if ok:
+            server.wait_for_result()
+
+        server.generate_report(filename=filename, filesize=filesize)
+
+        if not ok:
+            sys.exit(2)
+
     finally:
         server.close()
 

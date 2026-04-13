@@ -3,6 +3,7 @@ import hmac
 import hashlib
 import struct
 
+from cryptography.hazmat.backends import default_backend
 from cryptography.hazmat.primitives.kdf.hkdf import HKDF
 from cryptography.hazmat.primitives import hashes
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
@@ -40,6 +41,7 @@ def derive_session_keys(psk: bytes, client_nonce: bytes, server_nonce: bytes):
         length=32 + 32 + 4 + 4,
         salt=salt,
         info=b"srft-phase2",
+        backend=default_backend(),
     )
 
     key_material = hkdf.derive(psk)
