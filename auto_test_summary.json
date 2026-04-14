@@ -1,0 +1,38 @@
+{
+  "success": true,
+  "file_requested": "big.txt",
+  "original_file": "/app/big.txt",
+  "downloaded_file": "/app/downloaded_big.txt",
+  "downloaded_exists": true,
+  "original_md5": "1811ed45a571e515ed0faefc29f27026",
+  "downloaded_md5": "1811ed45a571e515ed0faefc29f27026",
+  "md5_match": true,
+  "client_return_code": 0,
+  "loss": "3%",
+  "delay": "40ms",
+  "interface": "lo",
+  "simulate_drop_once": null,
+  "duration_seconds": 1.297,
+  "server_log": "/app/auto_test_server.log",
+  "client_log": "/app/auto_test_client.log",
+  "server_report": {
+    "Name of the transferred file": "big.txt",
+    "Size of the transferred file": "5000 bytes",
+    "The number of packets sent from the server": "6",
+    "The number of retransmitted packets from the server": "0",
+    "The number of packets received from the client": "7",
+    "The time duration of the file transfer": "00:00:00",
+    "Sender MD5": "1811ed45a571e515ed0faefc29f27026",
+    "Sliding window size": "16",
+    "ACK receiver thread enabled": "Yes"
+  },
+  "client_report": {
+    "Output file": "/app/downloaded_big.txt",
+    "Sender file name": "big.txt",
+    "Sender size": "5000",
+    "Local size": "5000",
+    "Sender MD5": "1811ed45a571e515ed0faefc29f27026",
+    "Local MD5": "1811ed45a571e515ed0faefc29f27026",
+    "MD5 match": "True"
+  }
+}

@@ -1,0 +1,7 @@
+Security enabled (PSK + AEAD): Yes
+Handshake status: Success
+Output file: downloaded_big.txt
+Local size: 50000
+AEAD authentication failures: 1
+Replay drops: 6
+SHA-256 match: True

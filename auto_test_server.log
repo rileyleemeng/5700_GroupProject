@@ -1,0 +1,28 @@
+[Server] Starting raw UDP server on 127.0.0.1:12000
+[Server] Window size=16, timeout=0.4s
+[Server] Waiting for client request...
+[Server] Got REQUEST for 'big.txt' from ('127.0.0.1', 12001)
+[Server] File: big.txt, Size: 5000, MD5: 1811ed45a571e515ed0faefc29f27026
+[Server] File split into 5 chunks
+[DEBUG] ACK received: cumulative ack=1
+[DEBUG] ACK received: cumulative ack=2
+[DEBUG] ACK received: cumulative ack=3
+[DEBUG] ACK received: cumulative ack=4
+[DEBUG] ACK received: cumulative ack=5
+[Server] Progress: 5/5
+[Server] END acknowledged
+[DEBUG] ACK received: cumulative ack=5
+
+========== Transfer Report ==========
+- Name of the transferred file: big.txt
+- Size of the transferred file: 5000 bytes
+- The number of packets sent from the server: 6
+- The number of retransmitted packets from the server: 0
+- The number of packets received from the client: 7
+- The time duration of the file transfer: 00:00:00
+- Sender MD5: 1811ed45a571e515ed0faefc29f27026
+- Sliding window size: 16
+- ACK receiver thread enabled: Yes
+
+[Server] Report saved to server_report.txt
+[Server] Transfer complete!
