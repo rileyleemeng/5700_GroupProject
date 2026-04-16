@@ -1,11 +1,11 @@
 Name of the transferred file: big.txt
 Size of the transferred file: 50000
-The number of packets sent from the server: 67
-The number of retransmitted packets from the server: 7
-The number of packets received from the client: 64
+The number of packets sent from the server: 60
+The number of retransmitted packets from the server: 0
+The number of packets received from the client: 61
 The time duration of the file transfer (hh:min:ss): 00:00:00
 Security enabled (PSK + AEAD): Yes
 Handshake status: Success
 AEAD authentication failures (invalid packets dropped): 0
-Replay drops (duplicate/out-of-window packets): 13
+Replay drops (duplicate/out-of-window packets): 2
 SHA-256 match: Yes
