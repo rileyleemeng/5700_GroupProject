@@ -83,10 +83,11 @@ class SRFTUDPClient:
             socket.AF_INET, socket.SOCK_RAW, socket.IPPROTO_UDP
         )
         self.recv_sock.settimeout(self.timeout)
+        self.recv_sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 4 * 1024 * 1024)
  
         # ── Reliability state ──
         self.expected_seq = 0
-        self.buffer = {}               # out-of-order packet buffer
+        self.buffer = {}
         self.last_ack_sent = -1
  
         # ── Request / transfer state ──
@@ -101,14 +102,17 @@ class SRFTUDPClient:
         self.handshake_success = False
  
         # ── Statistics (matches sample report format) ──
-        self.packets_received = 0       # total packets received from server
-        self.duplicate_packets = 0      # packets with seq < expected_seq
-        self.out_of_order_packets = 0   # packets buffered (seq > expected_seq)
-        self.checksum_errors = 0        # outer SRFT checksum failures (decode → None)
-        self.aead_failures = 0          # AEAD authentication failures
-        self.replay_drops = 0           # duplicate buffered packets dropped
+        self.packets_received = 0
+        self.duplicate_packets = 0
+        self.out_of_order_packets = 0
+        self.checksum_errors = 0
+        self.aead_failures = 0
+        self.replay_drops = 0
         self.received_digest: Optional[bytes] = None
         self.start_time: Optional[float] = None
+ 
+        # ── Progress tracking ──
+        self._last_progress = -1
  
     # ================================================================
     #  Raw socket send / recv
@@ -122,7 +126,12 @@ class SRFTUDPClient:
             dst_port=self.server_port,
             payload=encode(packet),
         )
-        self.send_sock.sendto(raw_packet, (self.server_ip, 0))
+        for _retry in range(10):
+            try:
+                self.send_sock.sendto(raw_packet, (self.server_ip, 0))
+                break
+            except OSError:
+                time.sleep(0.005)
  
     def _recv_srft_packet(self) -> Tuple[Optional[Packet], Optional[Tuple[str, int]]]:
         while True:
@@ -133,7 +142,6 @@ class SRFTUDPClient:
  
             src_ip, dst_ip, src_port, dst_port, payload = parsed
  
-            # Filter: only accept packets from the expected server
             if src_ip != self.server_ip or dst_ip != self.client_ip:
                 continue
             if src_port != self.server_port or dst_port != self.client_port:
@@ -143,7 +151,6 @@ class SRFTUDPClient:
  
             pkt = decode(payload)
             if pkt is None:
-                # Outer SRFT checksum failed
                 self.checksum_errors += 1
                 return None, (src_ip, src_port)
  
@@ -168,10 +175,7 @@ class SRFTUDPClient:
             try:
                 resp, _ = self._recv_srft_packet()
  
-                if resp is None:
-                    continue
- 
-                if resp.pkt_type != SERVER_HELLO:
+                if resp is None or resp.pkt_type != SERVER_HELLO:
                     continue
  
                 payload = resp.payload
@@ -255,7 +259,6 @@ class SRFTUDPClient:
             plaintext=b'ACK',
         )
         self.last_ack_sent = self.expected_seq
-        print(f'[CLIENT] Sent secure cumulative ACK={self.expected_seq}')
  
     # ================================================================
     #  Secure receive loop
@@ -272,8 +275,6 @@ class SRFTUDPClient:
                 idle_timeouts = 0
  
                 if pkt is None:
-                    # checksum_errors already incremented in _recv_srft_packet
-                    print('[CLIENT] Corrupted outer packet ignored')
                     if self.transfer_started:
                         self.send_ack(force=True)
                     else:
@@ -284,42 +285,37 @@ class SRFTUDPClient:
                 if pkt.pkt_type in (DATA, DIGEST, END):
                     plaintext = self._decrypt_server_packet(pkt)
                     if plaintext is None:
-                        print('[CLIENT] AEAD authentication failed, packet dropped')
                         continue
  
                     # ── DATA packet ──
                     if pkt.pkt_type == DATA:
                         self.transfer_started = True
-                        print(f'[CLIENT] Received secure DATA seq={pkt.seq}, plain_len={len(plaintext)}')
  
                         if pkt.seq == self.expected_seq:
-                            # In-order delivery
                             file_data.extend(plaintext)
                             self.expected_seq += 1
  
-                            # Flush buffered consecutive packets
                             while self.expected_seq in self.buffer:
                                 file_data.extend(self.buffer.pop(self.expected_seq))
                                 self.expected_seq += 1
  
                             self.send_ack()
  
+                            # Progress (print every 5%)
+                            if self.expected_seq % 5000 == 0:
+                                elapsed = time.time() - self.start_time
+                                print(f'[CLIENT] Received {self.expected_seq} chunks, elapsed={elapsed:.0f}s')
+ 
                         elif pkt.seq > self.expected_seq:
-                            # Out-of-order: buffer it
                             if pkt.seq not in self.buffer:
                                 self.buffer[pkt.seq] = plaintext
                                 self.out_of_order_packets += 1
-                                print(f'[CLIENT] Buffered out-of-order seq={pkt.seq}')
                             else:
-                                # Already buffered – duplicate
                                 self.duplicate_packets += 1
-                                print(f'[CLIENT] Duplicate buffered seq={pkt.seq} dropped')
                             self.send_ack(force=True)
  
                         else:
-                            # seq < expected_seq → already received
                             self.duplicate_packets += 1
-                            print(f'[CLIENT] Duplicate seq={pkt.seq} dropped (expected {self.expected_seq})')
                             self.send_ack(force=True)
  
                     # ── DIGEST packet ──
@@ -333,18 +329,14 @@ class SRFTUDPClient:
                         self.transfer_started = True
                         print('[CLIENT] Received secure END')
  
-                        # Save file
                         with open(output_filename, 'wb') as f:
                             f.write(file_data)
  
-                        # Verify SHA-256
                         local_digest = sha256_bytes(bytes(file_data))
                         sha_match = (self.received_digest == local_digest)
  
-                        # Compute received file MD5
                         received_md5 = hashlib.md5(bytes(file_data)).hexdigest()
  
-                        # Send RESULT back to server
                         result_payload = b'OK' if sha_match else b'FAIL'
                         self._send_secure_packet(
                             pkt_type=RESULT,
@@ -353,7 +345,6 @@ class SRFTUDPClient:
                             plaintext=result_payload,
                         )
  
-                        # Transfer time
                         elapsed = time.time() - self.start_time
                         h = int(elapsed // 3600)
                         m = int((elapsed % 3600) // 60)
@@ -364,7 +355,6 @@ class SRFTUDPClient:
                         print(f'[CLIENT] AEAD failures: {self.aead_failures}')
                         print(f'[CLIENT] Replay/duplicate drops: {self.duplicate_packets}')
  
-                        # ── Client report (matches sample format) ──
                         report_lines = [
                             f'Security enabled (PSK + AEAD): Yes',
                             f'Handshake status: {"True" if self.handshake_success else "False"}',
@@ -401,13 +391,8 @@ class SRFTUDPClient:
                     print(f'[CLIENT] Server error: {message}')
                     return False
  
-                else:
-                    print(f'[CLIENT] Unexpected packet type={pkt.pkt_type}')
- 
             except socket.timeout:
                 idle_timeouts += 1
-                print(f'[CLIENT] Timeout ({idle_timeouts}/{self.max_idle_timeouts})')
- 
                 if not self.transfer_started:
                     if self.requested_filename:
                         self.request_file(self.requested_filename, retransmit=True)
@@ -417,10 +402,6 @@ class SRFTUDPClient:
                 if idle_timeouts >= self.max_idle_timeouts:
                     print('[CLIENT] Transfer failed: too many timeouts')
                     return False
- 
-    # ================================================================
-    #  Cleanup
-    # ================================================================
  
     def close(self) -> None:
         self.send_sock.close()
@@ -432,7 +413,6 @@ class SRFTUDPClient:
 # ====================================================================
  
 def load_psk(path: Optional[str]) -> bytes:
-    """Read PSK from a file, or fall back to the default in constants.py."""
     if path is None:
         return PSK
     with open(path, 'rb') as f:
@@ -451,8 +431,8 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument('--client-port', type=int, default=DEFAULT_CLIENT_PORT)
     p.add_argument('--timeout', type=float, default=TIMEOUT)
     p.add_argument('--max-idle-timeouts', type=int, default=MAX_IDLE_TIMEOUTS)
-    p.add_argument('--output', default=None, help='output file path; default: downloaded_<filename>')
-    p.add_argument('--psk-file', default=None, help='Path to PSK file (default: use built-in key)')
+    p.add_argument('--output', default=None, help='output file path')
+    p.add_argument('--psk-file', default=None, help='Path to PSK file')
     return p
  
  
@@ -488,4 +468,3 @@ def main() -> None:
  
 if __name__ == '__main__':
     main()
- 
