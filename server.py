@@ -449,7 +449,7 @@ class SRFTUDPServer:
             print('[SERVER] Sent secure END')
  
             wait_rounds = 0
-            while wait_rounds < 3:
+            while wait_rounds < 15:
                 try:
                     pkt, _ = self._recv_srft_packet()
                     if pkt is None or pkt.pkt_type != RESULT:

@@ -3,6 +3,7 @@ SRFT UDP Client – Phase 2  (Secure Reliable File Transfer)
   • PSK handshake  (ClientHello → ServerHello → HKDF key derivation)
   • AES-GCM AEAD encryption on every packet
   • Cumulative ACK with out-of-order buffering
+  • Streaming writes (never loads entire file into memory)
   • Full client report matching sample format
 """
  
@@ -261,147 +262,187 @@ class SRFTUDPClient:
         self.last_ack_sent = self.expected_seq
  
     # ================================================================
-    #  Secure receive loop
+    #  Streaming file helpers
+    # ================================================================
+ 
+    def _compute_file_sha256(self, filepath: str) -> bytes:
+        h = hashlib.sha256()
+        with open(filepath, 'rb') as f:
+            while True:
+                block = f.read(65536)
+                if not block:
+                    break
+                h.update(block)
+        return h.digest()
+ 
+    def _compute_file_md5(self, filepath: str) -> str:
+        h = hashlib.md5()
+        with open(filepath, 'rb') as f:
+            while True:
+                block = f.read(65536)
+                if not block:
+                    break
+                h.update(block)
+        return h.hexdigest()
+ 
+    # ================================================================
+    #  Secure receive loop  (streaming – writes to disk, not memory)
     # ================================================================
  
     def receive_file(self, output_filename: str) -> bool:
-        file_data = bytearray()
         idle_timeouts = 0
         self.start_time = time.time()
+        total_bytes_written = 0
  
-        while True:
-            try:
-                pkt, _ = self._recv_srft_packet()
-                idle_timeouts = 0
+        # Open file for streaming writes
+        out_f = open(output_filename, 'wb')
  
-                if pkt is None:
-                    if self.transfer_started:
-                        self.send_ack(force=True)
-                    else:
-                        if self.requested_filename:
-                            self.request_file(self.requested_filename, retransmit=True)
-                    continue
+        try:
+            while True:
+                try:
+                    pkt, _ = self._recv_srft_packet()
+                    idle_timeouts = 0
  
-                if pkt.pkt_type in (DATA, DIGEST, END):
-                    plaintext = self._decrypt_server_packet(pkt)
-                    if plaintext is None:
+                    if pkt is None:
+                        if self.transfer_started:
+                            self.send_ack(force=True)
+                        else:
+                            if self.requested_filename:
+                                self.request_file(self.requested_filename, retransmit=True)
                         continue
  
-                    # ── DATA packet ──
-                    if pkt.pkt_type == DATA:
-                        self.transfer_started = True
+                    if pkt.pkt_type in (DATA, DIGEST, END):
+                        plaintext = self._decrypt_server_packet(pkt)
+                        if plaintext is None:
+                            continue
  
-                        if pkt.seq == self.expected_seq:
-                            file_data.extend(plaintext)
-                            self.expected_seq += 1
+                        # ── DATA packet ──
+                        if pkt.pkt_type == DATA:
+                            self.transfer_started = True
  
-                            while self.expected_seq in self.buffer:
-                                file_data.extend(self.buffer.pop(self.expected_seq))
+                            if pkt.seq == self.expected_seq:
+                                # Write directly to disk
+                                out_f.write(plaintext)
+                                total_bytes_written += len(plaintext)
                                 self.expected_seq += 1
  
-                            self.send_ack()
+                                # Flush buffered out-of-order packets
+                                while self.expected_seq in self.buffer:
+                                    buffered = self.buffer.pop(self.expected_seq)
+                                    out_f.write(buffered)
+                                    total_bytes_written += len(buffered)
+                                    self.expected_seq += 1
  
-                            # Progress (print every 5%)
-                            if self.expected_seq % 5000 == 0:
-                                elapsed = time.time() - self.start_time
-                                print(f'[CLIENT] Received {self.expected_seq} chunks, elapsed={elapsed:.0f}s')
+                                self.send_ack()
  
-                        elif pkt.seq > self.expected_seq:
-                            if pkt.seq not in self.buffer:
-                                self.buffer[pkt.seq] = plaintext
-                                self.out_of_order_packets += 1
+                                # Progress (print every 5000 chunks)
+                                if self.expected_seq % 5000 == 0:
+                                    elapsed = time.time() - self.start_time
+                                    print(f'[CLIENT] Received {self.expected_seq} chunks, elapsed={elapsed:.0f}s')
+ 
+                            elif pkt.seq > self.expected_seq:
+                                if pkt.seq not in self.buffer:
+                                    self.buffer[pkt.seq] = plaintext
+                                    self.out_of_order_packets += 1
+                                else:
+                                    self.duplicate_packets += 1
+                                self.send_ack(force=True)
+ 
                             else:
                                 self.duplicate_packets += 1
-                            self.send_ack(force=True)
+                                self.send_ack(force=True)
  
-                        else:
-                            self.duplicate_packets += 1
-                            self.send_ack(force=True)
+                        # ── DIGEST packet ──
+                        elif pkt.pkt_type == DIGEST:
+                            self.transfer_started = True
+                            self.received_digest = plaintext
+                            print('[CLIENT] Received secure DIGEST')
  
-                    # ── DIGEST packet ──
-                    elif pkt.pkt_type == DIGEST:
+                        # ── END packet ──
+                        elif pkt.pkt_type == END:
+                            self.transfer_started = True
+                            print('[CLIENT] Received secure END')
+ 
+                            # Close the file before computing hashes
+                            out_f.close()
+                            out_f = None
+ 
+                            # Compute hashes from disk (streaming, no full load)
+                            local_digest = self._compute_file_sha256(output_filename)
+                            sha_match = (self.received_digest == local_digest)
+ 
+                            received_md5 = self._compute_file_md5(output_filename)
+                            file_size = os.path.getsize(output_filename)
+ 
+                            result_payload = b'OK' if sha_match else b'FAIL'
+                            self._send_secure_packet(
+                                pkt_type=RESULT,
+                                seq=self.expected_seq + 100000,
+                                ack=self.expected_seq,
+                                plaintext=result_payload,
+                            )
+ 
+                            elapsed = time.time() - self.start_time
+                            h = int(elapsed // 3600)
+                            m = int((elapsed % 3600) // 60)
+                            s = int(elapsed % 60)
+ 
+                            print(f'[CLIENT] File saved as: {output_filename}')
+                            print(f'[CLIENT] SHA-256 match: {sha_match}')
+                            print(f'[CLIENT] AEAD failures: {self.aead_failures}')
+                            print(f'[CLIENT] Replay/duplicate drops: {self.duplicate_packets}')
+ 
+                            report_lines = [
+                                f'Security enabled (PSK + AEAD): Yes',
+                                f'Handshake status: {"True" if self.handshake_success else "False"}',
+                                f'Size of the transferred file: {file_size} bytes',
+                                f'Number of packets received from server: {self.packets_received}',
+                                f'Number of duplicate packets: {self.duplicate_packets}',
+                                f'Number of out of order packets: {self.out_of_order_packets}',
+                                f'Number of packets with checksum errors: {self.checksum_errors}',
+                                f'Time duration of the file transfer: {h:02d}:{m:02d}:{s:02d}',
+                                f'Received file MD5: {received_md5}',
+                                f'AEAD authentication failures: {self.aead_failures}',
+                                f'SHA-256 match: {"Yes" if sha_match else "No"}',
+                            ]
+                            report = '\n'.join(report_lines) + '\n'
+ 
+                            print('\n' + '=' * 50)
+                            print('CLIENT REPORT')
+                            print('=' * 50)
+                            print(report)
+                            print('=' * 50)
+ 
+                            with open('client_report.txt', 'w') as f:
+                                f.write(report)
+                            print('[CLIENT] Report saved to client_report.txt')
+ 
+                            return sha_match
+ 
+                    elif pkt.pkt_type == ERROR:
                         self.transfer_started = True
-                        self.received_digest = plaintext
-                        print('[CLIENT] Received secure DIGEST')
+                        try:
+                            message = pkt.payload.decode('utf-8', errors='replace')
+                        except Exception:
+                            message = 'server returned ERROR'
+                        print(f'[CLIENT] Server error: {message}')
+                        return False
  
-                    # ── END packet ──
-                    elif pkt.pkt_type == END:
-                        self.transfer_started = True
-                        print('[CLIENT] Received secure END')
+                except socket.timeout:
+                    idle_timeouts += 1
+                    if not self.transfer_started:
+                        if self.requested_filename:
+                            self.request_file(self.requested_filename, retransmit=True)
+                    else:
+                        self.send_ack(force=True)
  
-                        with open(output_filename, 'wb') as f:
-                            f.write(file_data)
+                    if idle_timeouts >= self.max_idle_timeouts:
+                        print('[CLIENT] Transfer failed: too many timeouts')
+                        return False
  
-                        local_digest = sha256_bytes(bytes(file_data))
-                        sha_match = (self.received_digest == local_digest)
- 
-                        received_md5 = hashlib.md5(bytes(file_data)).hexdigest()
- 
-                        result_payload = b'OK' if sha_match else b'FAIL'
-                        self._send_secure_packet(
-                            pkt_type=RESULT,
-                            seq=self.expected_seq + 100000,
-                            ack=self.expected_seq,
-                            plaintext=result_payload,
-                        )
- 
-                        elapsed = time.time() - self.start_time
-                        h = int(elapsed // 3600)
-                        m = int((elapsed % 3600) // 60)
-                        s = int(elapsed % 60)
- 
-                        print(f'[CLIENT] File saved as: {output_filename}')
-                        print(f'[CLIENT] SHA-256 match: {sha_match}')
-                        print(f'[CLIENT] AEAD failures: {self.aead_failures}')
-                        print(f'[CLIENT] Replay/duplicate drops: {self.duplicate_packets}')
- 
-                        report_lines = [
-                            f'Security enabled (PSK + AEAD): Yes',
-                            f'Handshake status: {"True" if self.handshake_success else "False"}',
-                            f'Size of the transferred file: {len(file_data)} bytes',
-                            f'Number of packets received from server: {self.packets_received}',
-                            f'Number of duplicate packets: {self.duplicate_packets}',
-                            f'Number of out of order packets: {self.out_of_order_packets}',
-                            f'Number of packets with checksum errors: {self.checksum_errors}',
-                            f'Time duration of the file transfer: {h:02d}:{m:02d}:{s:02d}',
-                            f'Received file MD5: {received_md5}',
-                            f'AEAD authentication failures: {self.aead_failures}',
-                            f'SHA-256 match: {"Yes" if sha_match else "No"}',
-                        ]
-                        report = '\n'.join(report_lines) + '\n'
- 
-                        print('\n' + '=' * 50)
-                        print('CLIENT REPORT')
-                        print('=' * 50)
-                        print(report)
-                        print('=' * 50)
- 
-                        with open('client_report.txt', 'w') as f:
-                            f.write(report)
-                        print('[CLIENT] Report saved to client_report.txt')
- 
-                        return sha_match
- 
-                elif pkt.pkt_type == ERROR:
-                    self.transfer_started = True
-                    try:
-                        message = pkt.payload.decode('utf-8', errors='replace')
-                    except Exception:
-                        message = 'server returned ERROR'
-                    print(f'[CLIENT] Server error: {message}')
-                    return False
- 
-            except socket.timeout:
-                idle_timeouts += 1
-                if not self.transfer_started:
-                    if self.requested_filename:
-                        self.request_file(self.requested_filename, retransmit=True)
-                else:
-                    self.send_ack(force=True)
- 
-                if idle_timeouts >= self.max_idle_timeouts:
-                    print('[CLIENT] Transfer failed: too many timeouts')
-                    return False
+        finally:
+            if out_f is not None:
+                out_f.close()
  
     def close(self) -> None:
         self.send_sock.close()
@@ -468,3 +509,4 @@ def main() -> None:
  
 if __name__ == '__main__':
     main()
+ 
