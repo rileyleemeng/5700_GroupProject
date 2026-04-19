@@ -363,8 +363,36 @@ class SRFTUDPClient:
                             self.transfer_started = True
                             print('[CLIENT] Received secure END')
  
+                            # CRITICAL: Flush any buffered out-of-order chunks before closing
+                            # Wait a bit for buffer to be processed naturally
+                            max_wait = 50  # 50 * 0.1s = 5 seconds max
+                            wait_count = 0
+                            while self.buffer and wait_count < max_wait:
+                                # Check if next_seq in buffer and write it
+                                if self.expected_seq in self.buffer:
+                                    buffered = self.buffer.pop(self.expected_seq)
+                                    if out_f is not None:
+                                        out_f.write(buffered)
+                                        total_bytes_written += len(buffered)
+                                    self.expected_seq += 1
+                                else:
+                                    time.sleep(0.1)
+                                    wait_count += 1
+ 
+                            if self.buffer:
+                                print(f'[CLIENT] WARNING: Buffer still has {len(self.buffer)} chunks with gaps')
+                                print(f'[CLIENT] expected_seq={self.expected_seq}, buffer keys={sorted(self.buffer.keys())[:10]}...')
+ 
+                            # Force-flush any remaining buffer to file (shouldn't happen)
+                            for seq in sorted(self.buffer.keys()):
+                                if out_f is not None and seq == self.expected_seq:
+                                    out_f.write(self.buffer[seq])
+                                    self.expected_seq += 1
+                            self.buffer.clear()
+ 
                             # Close the file before computing hashes
-                            out_f.close()
+                            if out_f is not None:
+                                out_f.close()
                             out_f = None
  
                             # Compute hashes from disk (streaming, no full load)
