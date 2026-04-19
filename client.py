@@ -333,7 +333,6 @@ class SRFTUDPClient:
                                     total_bytes_written += len(buffered)
                                     self.expected_seq += 1
  
-                                # ✅ Send ACK on new data
                                 self.send_ack()
  
                                 # Progress (print every 5000 chunks)
@@ -347,7 +346,6 @@ class SRFTUDPClient:
                                     self.out_of_order_packets += 1
                                 else:
                                     self.duplicate_packets += 1
-                                # ✅ Send heartbeat ACK (SERVER still knows client is alive)
                                 self.send_ack(force=True)
  
                             else:
