@@ -20,12 +20,12 @@ MAX_PAYLOAD = 900
 RAW_RECV_BUFFER = 65535
 
 # Reliability defaults
-TIMEOUT = 0.5
+TIMEOUT = 1.0  # Increased from 0.5s → 1.0s (large file needs patience)
 MAX_RETRIES = 15
-WINDOW_SIZE = 8
+WINDOW_SIZE = 16  # Increased from 8 → 16 (more aggressive pipelining)
 ACK_POLL_INTERVAL = 0.01
 END_RETRIES = 10
-MAX_IDLE_TIMEOUTS = 20
+MAX_IDLE_TIMEOUTS = 100  # Keep this: 100 * 1.0s = 100 seconds max wait 
 
 # Default ports
 DEFAULT_SERVER_PORT = 12000
@@ -46,5 +46,4 @@ NONCE_PREFIX_LEN = 4      # 4-byte prefix
 AES_GCM_NONCE_LEN = 12    # 4-byte prefix + 8-byte counter
 
 # Pre-shared key
-# 先写死，后面也可以改成从配置文件读取
 PSK = b"replace-with-32+bytes-random-key!!!"
