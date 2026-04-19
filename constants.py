@@ -16,7 +16,7 @@ HEADER_LEN = 13
 
 # Application payload size (SRFT payload inside UDP payload)
 # Leave room for AES-GCM overhead
-MAX_PAYLOAD = 1200
+MAX_PAYLOAD = 900
 RAW_RECV_BUFFER = 65535
 
 # Reliability defaults
