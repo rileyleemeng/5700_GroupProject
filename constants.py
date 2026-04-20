@@ -20,13 +20,12 @@ MAX_PAYLOAD = 900
 RAW_RECV_BUFFER = 65535
 
 # Reliability defaults
-TIMEOUT = 1.0  # Increased from 0.5s → 1.0s (large file needs patience)
+TIMEOUT = 0.5  
 MAX_RETRIES = 15
-WINDOW_SIZE = 16  # Increased from 8 → 16 (more aggressive pipelining)
+WINDOW_SIZE = 32  
 ACK_POLL_INTERVAL = 0.01
 END_RETRIES = 10
-MAX_IDLE_TIMEOUTS = 100  # Keep this: 100 * 1.0s = 100 seconds max wait 
-
+MAX_IDLE_TIMEOUTS = 100  
 # Default ports
 DEFAULT_SERVER_PORT = 12000
 DEFAULT_CLIENT_PORT = 12001
