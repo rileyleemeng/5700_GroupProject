@@ -403,6 +403,7 @@ class SRFTUDPClient:
                                 f'Time duration of the file transfer: {h:02d}:{m:02d}:{s:02d}',
                                 f'Received file MD5: {received_md5}',
                                 f'AEAD authentication failures: {self.aead_failures}',
+                                f'Replay drops (duplicate/out-of-window packets): {self.duplicate_packets}',
                                 f'SHA-256 match: {"Yes" if sha_match else "No"}',
                             ]
                             report = '\n'.join(report_lines) + '\n'
